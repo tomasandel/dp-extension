@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SCT Inspector</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🔒 SCT Certificate Inspector</h1>
+    </header>
+
+    <main id="content">
+      <div id="loading">Loading certificate data...</div>
+      <div id="error" class="hidden"></div>
+      <div id="data" class="hidden">
+        <!-- Certificate info will be injected here -->
+      </div>
+    </main>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
