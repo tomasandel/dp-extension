@@ -72,10 +72,9 @@ browser.webRequest.onHeadersReceived.addListener(
       // Store in cache indexed by tab ID for popup access
       certificateCache.set(details.tabId, certData);
 
-      console.log(`[SCT Inspector] Extracted certificate data for ${details.url}`);
-      console.log(certData);
+      console.log(`[SCT Inspector] Extracted certificate data`, certData);
 
-      const verificationResult = await verifyCertificateSCTs(certData);
+      const verificationResult = await ctVerify.verifyCertificateSCTs(certData);
 
       const verifyEndTime = performance.now();
       const verificationTimeMs = Math.round(verifyEndTime - verifyStartTime);
@@ -218,9 +217,6 @@ function buildLogIdMap(logListData) {
 }
 
 function injectLogInfo(scts) {
-
-  if (!ctLogList) return scts;
-
   return scts.map(sct => {
     const logInfo = ctLogList[sct.logId];
     if (logInfo) {
@@ -246,6 +242,21 @@ browser.tabs.onRemoved.addListener((tabId) => {
   console.log(`[SCT Inspector] Cleaned up cache for closed tab ${tabId}`);
 });
 
+/**
+ * Converts base64 string to hex string
+ * @param {string} base64 - Base64 encoded string
+ * @returns {string} Hex string
+ */
+function base64ToHex(base64) {
+  const binary = atob(base64);
+  let hex = '';
+  for (let i = 0; i < binary.length; i++) {
+    const byte = binary.charCodeAt(i).toString(16).padStart(2, '0');
+    hex += byte;
+  }
+  return hex;
+}
+
 // Initialize
 (async () => {
   console.log("[SCT Inspector] Starting background script...");
@@ -255,3 +266,4 @@ browser.tabs.onRemoved.addListener((tabId) => {
   console.log("[SCT Inspector] Background script loaded and ready");
   console.log("[SCT Inspector] Waiting for onHeadersReceived...");
 })();
+

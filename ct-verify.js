@@ -1,153 +1,102 @@
 /**
- * CT Log Verification Module
+ * CT Verification Module
  *
- * Verifies Certificate Transparency SCTs by:
- * 1. Extracting TBSCertificate from leaf certificate
- * 2. Removing SCT extension to reconstruct the precertificate
- * 3. Building MerkleTreeLeaf structure
- * 4. Fetching audit proofs from CT logs
- * 5. Computing and verifying Merkle tree roots
+ * Verifies Proof of Inclusion.
  */
+
+import * as pkijs from 'pkijs';
+import * as asn1js from 'asn1js';
+import { Convert, BufferSourceConverter } from 'pvtsutils';
 
 /**
- * Extracts TBSCertificate from X.509 certificate
- * Certificate structure: SEQUENCE { TBSCertificate, SignatureAlgorithm, Signature }
+ * Verifies all SCTs in a certificate
+ * @param {object} certData - Certificate data including SCTs and certificates
+ * @returns {Promise<object>} Verification results
  */
-function extractTBSCertificate(certDER) {
-  const bytes = new Uint8Array(certDER);
-  let pos = 0;
+async function verifyCertificateSCTs(certData) {
+  console.log('[CT Verify] Starting SCT verification');
 
-  if (bytes[pos] !== ASN1_SEQUENCE_TAG) return null;
-  pos++;
+  console.log('[CT Verify] Extracting precert TBS from leaf cert');
+  const modifiedTBS = extractPrecertTBS(certData.certificates[0].rawDER);
 
-  const certLenResult = parseASN1Length(bytes, pos);
-  pos = certLenResult.nextPos;
+  console.log('[CT Verify] Getting issuer key hash from issuer cert');
+  const issuerKeyHash = getIssuerKeyHash(certData.certificates[1]);
+  
+  console.log('[CT Verify] Verifying SCTs -------------------');
+  // Verify each SCT
+  const results = [];
+  for (const sct of certData.scts) {
+    const verified = await verifySCT(sct, issuerKeyHash, modifiedTBS);
+    results.push({ sct, verified });
+  }
 
-  const tbsStart = pos;
-  if (bytes[pos] !== ASN1_SEQUENCE_TAG) return null;
-  pos++;
+  console.log('[CT Verify] Verification results:', results);
 
-  const tbsLenResult = parseASN1Length(bytes, pos);
-  const tbsLength = tbsLenResult.length;
-  const tbsDataStart = tbsLenResult.nextPos;
-  const tbsEnd = tbsDataStart + tbsLength;
+  const verifiedCount = results.filter(r => r.verified).length;
 
-  return bytes.slice(tbsStart, tbsEnd);
+  return {
+    verified: verifiedCount,
+    total: results.length,
+    results
+  };
 }
 
 /**
- * Removes SCT extension (OID 1.3.6.1.4.1.11129.2.4.2) from TBSCertificate
- * This reconstructs the precertificate that was originally submitted to CT logs
+ * Extracts the TBS portion of a precertificate by removing SCT extension
+ * @param {Array<number>} certDER - Raw DER-encoded certificate data
+ * @returns {Uint8Array} TBS certificate bytes
  */
-function removeSCTExtension(tbsCert) {
-  const bytes = new Uint8Array(tbsCert);
-
-  if (bytes[0] !== ASN1_SEQUENCE_TAG) return null;
-
-  const { nextPos: tbsContentStart } = parseASN1Length(bytes, 1);
-
-  for (let i = tbsContentStart; i < bytes.length - SCT_OID.length; i++) {
-    if (bytes[i] !== ASN1_CONTEXT_3_TAG) continue;
-    if (i + 1 >= bytes.length) continue;
-
-    const extLenResult = parseASN1Length(bytes, i + 1);
-    const extSeqStart = extLenResult.nextPos;
-    const extFieldEnd = extSeqStart + extLenResult.length;
-
-    if (extLenResult.length < 0 || extLenResult.length > MAX_EXTENSION_SIZE ||
-        extFieldEnd > bytes.length || bytes[extSeqStart] !== ASN1_SEQUENCE_TAG) {
-      continue;
-    }
-
-    if (!containsOID(bytes, extSeqStart, extFieldEnd, SCT_OID)) continue;
-
-    const filteredExtensions = filterSCTFromExtensions(bytes.slice(extSeqStart, extFieldEnd));
-    if (!filteredExtensions) return null;
-
-    const newExtensionsField = new Uint8Array([
-      ASN1_CONTEXT_3_TAG,
-      ...encodeASN1Length(filteredExtensions.length),
-      ...filteredExtensions
-    ]);
-
-    const newTBSContent = new Uint8Array([
-      ...bytes.slice(tbsContentStart, i),
-      ...newExtensionsField,
-      ...bytes.slice(extFieldEnd)
-    ]);
-
-    return new Uint8Array([
-      ASN1_SEQUENCE_TAG,
-      ...encodeASN1Length(newTBSContent.length),
-      ...newTBSContent
-    ]);
+function extractPrecertTBS(certDER) {
+  const asn1 = asn1js.fromBER(new Uint8Array(certDER).buffer);
+  const cert = new pkijs.Certificate({ schema: asn1.result });
+  
+  // Remove the SCT extension (OID: 1.3.6.1.4.1.11129.2.4.2)
+  if (cert.extensions) {
+    cert.extensions = cert.extensions.filter(
+      ext => ext.extnID !== '1.3.6.1.4.1.11129.2.4.2'
+    );
   }
 
-  // No SCT extension found
-  return tbsCert;
+  // Re-encode the TBS certificate
+  const tbsSchema = cert.encodeTBS();
+  const tbsBytes = tbsSchema.toBER(false);
+  
+  return new Uint8Array(tbsBytes);
 }
 
-/**
- * Filters out SCT extension from the extensions SEQUENCE
- */
-function filterSCTFromExtensions(extensionsBytes) {
-  const bytes = extensionsBytes;
-  let pos = 0;
-
-  if (bytes[pos] !== ASN1_SEQUENCE_TAG) return null;
-  pos++;
-
-  const seqLenResult = parseASN1Length(bytes, pos);
-  pos = seqLenResult.nextPos;
-  const seqEnd = pos + seqLenResult.length;
-
-  const keptExtensions = [];
-
-  while (pos < seqEnd) {
-    const extStart = pos;
-    if (bytes[pos] !== ASN1_SEQUENCE_TAG) break;
-    pos++;
-
-    const extLenResult = parseASN1Length(bytes, pos);
-    const extLen = extLenResult.length;
-    const extContentStart = extLenResult.nextPos;
-    const extEnd = extContentStart + extLen;
-
-    if (!containsOID(bytes, extContentStart, extEnd, SCT_OID)) {
-      keptExtensions.push(bytes.slice(extStart, extEnd));
-    }
-
-    pos = extEnd;
-  }
-
-  const totalKeptLength = keptExtensions.reduce((sum, ext) => sum + ext.length, 0);
-  const keptExtensionsData = new Uint8Array(totalKeptLength);
-  let offset = 0;
-  for (const ext of keptExtensions) {
-    keptExtensionsData.set(ext, offset);
-    offset += ext.length;
-  }
-
-  const newSeqTag = [ASN1_SEQUENCE_TAG];
-  const newSeqLen = encodeASN1Length(keptExtensionsData.length);
-
-  return new Uint8Array([...newSeqTag, ...newSeqLen, ...keptExtensionsData]);
-}
-
-/**
- * Extracts issuer key hash from issuer certificate
- * Returns SHA-256 hash of SubjectPublicKeyInfo
- */
 function getIssuerKeyHash(issuerCert) {
-  return base64ToBytes(issuerCert.subjectPublicKeyInfoDigest.sha256);
+  return new Uint8Array(Convert.FromBase64(issuerCert.subjectPublicKeyInfoDigest.sha256));
 }
 
 /**
- * Builds a MerkleTreeLeaf for precert_entry type
+ * Verifies a single SCT against its CT log
+ * Returns true if computed Merkle root matches the log's root hash
+ */
+async function verifySCT(sct, issuerKeyHash, modifiedTBS) {
+  console.log('[CT Verify] Starting verification for SCT:', sct);
+  console.log(`[CT Verify] from log: ${sct.logUrl || sct.logId}`);
+  const merkleTreeLeaf = buildMerkleTreeLeaf(sct, issuerKeyHash, modifiedTBS);
+  const proofResult = await fetchAuditProof(merkleTreeLeaf, sct);
+
+  if (!proofResult) {
+    return false;
+  }
+
+  const { proof, leafHash, rootHash, treeSize } = proofResult;
+
+  // Verify the audit proof
+  const isValid = await verifyAuditProof(leafHash, proof.leaf_index, proof.audit_path, treeSize, rootHash);
+
+  return isValid;
+}
+
+/**
+ * Builds a MerkleTreeLeaf for precert_entry type (RFC 6962)
  * Structure: version(1) + leaf_type(1) + timestamp(8) + entry_type(2) +
  *            issuer_key_hash(32) + tbs_length(3) + tbs_certificate + extensions(2)
  */
-function buildPrecertEntry(sct, issuerKeyHash, tbsCertificate) {
+function buildMerkleTreeLeaf(sct, issuerKeyHash, tbsCertificate) {
+  console.log('[CT Verify] Building MerkleTreeLeaf');
   const leaf = [];
   leaf.push(0x00); // version
   leaf.push(0x00); // leaf_type (timestamped_entry)
@@ -157,6 +106,7 @@ function buildPrecertEntry(sct, issuerKeyHash, tbsCertificate) {
 
   leaf.push(0x00, 0x01); // entry_type (precert_entry)
   leaf.push(...issuerKeyHash); // 32 bytes
+
 
   const tbsLengthBytes = encodeBigEndian(tbsCertificate.length, 3);
   leaf.push(...tbsLengthBytes);
@@ -168,55 +118,18 @@ function buildPrecertEntry(sct, issuerKeyHash, tbsCertificate) {
 }
 
 /**
- * Gets tree head information from SCT or by fetching STH
- * For readonly logs: uses final_tree_head from log state
- * For active/retired logs: fetches current STH from log
- */
-async function getTreeHeadInfo(sct) {
-  if (sct.logState && sct.logState.readonly) {
-    return {
-      treeSize: sct.logState.readonly.final_tree_head.tree_size,
-      rootHash: base64ToBytes(sct.logState.readonly.final_tree_head.sha256_root_hash)
-    };
-  }
-
-  const sthUrl = `${sct.logUrl}ct/v1/get-sth`;
-
-  try {
-    const response = await fetch(sthUrl);
-    if (!response.ok) return null;
-
-    const sth = await response.json();
-    return {
-      treeSize: sth.tree_size,
-      rootHash: base64ToBytes(sth.sha256_root_hash)
-    };
-  } catch (error) {
-    return null;
-  }
-}
-
-/**
  * Hashes the MerkleTreeLeaf and fetches audit proof from CT log
  * Leaf hash = SHA-256(0x00 || leaf_data)
  */
 async function fetchAuditProof(merkleTreeLeaf, sct) {
-  console.log('[CT Verify] === MerkleTreeLeaf Structure Before Hashing ===');
-  console.log('[CT Verify] Length:', merkleTreeLeaf.length, 'bytes');
-  console.log('[CT Verify] Version:', merkleTreeLeaf[0]);
-  console.log('[CT Verify] Leaf type:', merkleTreeLeaf[1]);
-  console.log('[CT Verify] Timestamp:', Array.from(merkleTreeLeaf.slice(2, 10)).map(b => b.toString(16).padStart(2, '0')).join(''));
-  console.log('[CT Verify] Entry type:', merkleTreeLeaf[10], merkleTreeLeaf[11]);
-  console.log('[CT Verify] Issuer key hash:', Array.from(merkleTreeLeaf.slice(12, 44)).map(b => b.toString(16).padStart(2, '0')).join(''));
-  const tbsLength = (merkleTreeLeaf[44] << 16) | (merkleTreeLeaf[45] << 8) | merkleTreeLeaf[46];
-  console.log('[CT Verify] TBS length:', tbsLength);
-  console.log('[CT Verify] Extensions:', merkleTreeLeaf[47 + tbsLength], merkleTreeLeaf[48 + tbsLength]);
-  console.log('[CT Verify] Full structure (hex):', Array.from(merkleTreeLeaf).map(b => b.toString(16).padStart(2, '0')).join(''));
-
+  console.log('[CT Verify] Fetching audit proof from log');
+  
+  // Prepend 0x00 byte for leaf hash
   const leafWithPrefix = new Uint8Array(1 + merkleTreeLeaf.length);
   leafWithPrefix[0] = 0x00;
   leafWithPrefix.set(merkleTreeLeaf, 1);
 
+  // Compute SHA-256 hash of the leaf
   const leafHashBuffer = await crypto.subtle.digest('SHA-256', leafWithPrefix);
   const leafHash = new Uint8Array(leafHashBuffer);
 
@@ -228,15 +141,16 @@ async function fetchAuditProof(merkleTreeLeaf, sct) {
 
   const { treeSize, rootHash } = treeHeadInfo;
 
+  // Convert leaf hash to base64 for URL
   const leafHashB64 = btoa(String.fromCharCode(...leafHash));
-  const url = `${sct.logUrl}ct/v1/get-proof-by-hash?hash=${encodeURIComponent(leafHashB64)}&tree_size=${treeSize}`;
 
+  // Fetch audit proof from log
+  const url = `${sct.logUrl}ct/v1/get-proof-by-hash?hash=${encodeURIComponent(leafHashB64)}&tree_size=${treeSize}`;
   try {
     const response = await fetch(url);
     if (!response.ok) {
       return null;
     }
-
     const proof = await response.json();
     return { proof, leafHash, rootHash, treeSize };
   } catch (error) {
@@ -246,97 +160,131 @@ async function fetchAuditProof(merkleTreeLeaf, sct) {
 }
 
 /**
- * Hashes two nodes together: SHA-256(0x01 || left || right)
+ * Verifies Merkle audit proof according to RFC 9162 Section 2.1.3.2
+ * @param {Uint8Array} leafHash - Hash of the leaf being verified
+ * @param {number} leafIndex - Index of the leaf in the tree
+ * @param {Array<string>} auditPath - Array of base64-encoded sibling hashes
+ * @param {number} treeSize - Size of the Merkle tree
+ * @param {Uint8Array} rootHash - Expected root hash to verify against
+ * @returns {Promise<boolean>} True if proof is valid
  */
-async function hashNodes(left, right) {
-  const combined = new Uint8Array(MERKLE_NODE_SIZE);
-  combined[0] = 0x01;
+async function verifyAuditProof(leafHash, leafIndex, auditPath, treeSize, rootHash) {
+  console.log('[CT Verify] Verifying audit proof');
+  console.log(`[CT Verify] Leaf index: ${leafIndex}, Tree size: ${treeSize}, Path length: ${auditPath.length}`);
+
+  // Validate leaf index
+  if (leafIndex >= treeSize) {
+    console.log('[CT Verify] Invalid: leaf index >= tree size');
+    return false;
+  }
+
+  // Initialize variables
+  let fn = leafIndex;
+  let sn = treeSize - 1;
+  let r = leafHash;
+
+  // Process each node in the audit path
+  for (const pathNode of auditPath) {
+    if (sn === 0) {
+      console.log('[CT Verify] Invalid: sn reached 0 before end of path');
+      return false;
+    }
+
+    const p = new Uint8Array(Convert.FromBase64(pathNode));
+
+    // Determine hash order based on LSB of fn or fn == sn
+    if ((fn & 1) === 1 || fn === sn) {
+      // Hash on left: HASH(0x01 || p || r)
+      r = await hashNode(p, r);
+
+      // If LSB(fn) is not set, right-shift fn and sn until LSB(fn) is set or fn is 0
+      if ((fn & 1) === 0) {
+        while ((fn & 1) === 0 && fn !== 0) {
+          fn >>= 1;
+          sn >>= 1;
+        }
+      }
+    } else {
+      // Hash on right: HASH(0x01 || r || p)
+      r = await hashNode(r, p);
+    }
+
+    fn >>= 1;
+    sn >>= 1;
+  }
+
+  // Final verification
+  if (sn !== 0) {
+    console.log('[CT Verify] Invalid: sn not 0 at end');
+    return false;
+  }
+
+  // Compare computed root with expected root
+  const isValid = BufferSourceConverter.isEqual(r, rootHash);
+  console.log(`[CT Verify] Proof verification result: ${isValid}`);
+
+  return isValid;
+}
+
+/**
+ * Hashes two nodes together with 0x01 prefix (RFC 9162)
+ * Hash = SHA-256(0x01 || left || right)
+ */
+async function hashNode(left, right) {
+  const combined = new Uint8Array(1 + left.length + right.length);
+  combined[0] = 0x01; // Internal node prefix
   combined.set(left, 1);
-  combined.set(right, 1 + HASH_SIZE);
+  combined.set(right, 1 + left.length);
+
   const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
   return new Uint8Array(hashBuffer);
 }
 
 /**
- * Computes Merkle tree root from leaf hash and audit path
+ * Gets tree head information from SCT or by fetching STH
+ * For readonly logs: uses final_tree_head from log state
+ * For active/retired logs: fetches current STH from log
  */
-async function computeMerkleRoot(leafHash, leafIndex, auditPath, treeSize) {
-  let index = leafIndex;
-  let hash = leafHash;
+async function getTreeHeadInfo(sct) {
+  console.log('[CT Verify] Getting tree head info for SCT:', sct);
 
-  for (const pathNode of auditPath) {
-    const sibling = base64ToBytes(pathNode);
-
-    if (index % 2 === 0) {
-      hash = await hashNodes(hash, sibling);
-    } else {
-      hash = await hashNodes(sibling, hash);
-    }
-
-    index = Math.floor(index / 2);
+  // If log is readonly, use final_tree_head from log state
+  if (sct.logState && sct.logState.readonly) {
+    const finalTreeHead = sct.logState.readonly.final_tree_head;
+    return {
+      treeSize: finalTreeHead.tree_size,
+      rootHash: new Uint8Array(Convert.FromBase64(finalTreeHead.sha256_root_hash))
+    };
   }
 
-  return hash;
+  // Otherwise, fetch current STH from log
+  const sthUrl = `${sct.logUrl}ct/v1/get-sth`;
+  try {
+    const response = await fetch(sthUrl);
+    if (!response.ok) return null;
+
+    const sth = await response.json();
+    return {
+      treeSize: sth.tree_size,
+      rootHash: new Uint8Array(Convert.FromBase64(sth.sha256_root_hash))
+    };
+  } catch (error) {
+    return null;
+  }
 }
 
 /**
- * Verifies a single SCT against its CT log
- * Returns true if computed Merkle root matches the log's root hash
+ * Encodes a number as big-endian bytes
+ * @param {number|bigint} value - Value to encode
+ * @param {number} numBytes - Number of bytes to use
+ * @returns {Array<number>} Big-endian byte array
  */
-async function verifySCT(sct, issuerKeyHash, modifiedTBS) {
-  console.log(`[CT Verify] Starting verification for SCT from log: ${sct.logUrl || sct.logId}`);
-  const merkleTreeLeaf = buildPrecertEntry(sct, issuerKeyHash, modifiedTBS);
-  const proofResult = await fetchAuditProof(merkleTreeLeaf, sct);
+function encodeBigEndian(value, numBytes) {
+  const buffer = new ArrayBuffer(8);
+  const view = new DataView(buffer);
+  view.setBigUint64(0, BigInt(value), false);
 
-  if (!proofResult) {
-    return false;
-  }
-
-  const { proof, leafHash, rootHash, treeSize } = proofResult;
-  const computedRoot = await computeMerkleRoot(leafHash, proof.leaf_index, proof.audit_path, treeSize);
-
-  return bytesEqual(computedRoot, rootHash);
+  // Return only the last numBytes (big-endian = leading bytes are zeros for small values)
+  return new Uint8Array(buffer.slice(8 - numBytes));
 }
-
-/**
- * Verifies all SCTs in a certificate
- * Returns: { total, verified, failed, results: [{sct, verified}] }
- */
-async function verifyCertificateSCTs(certData) {
-  if (!certData || !certData.scts || certData.scts.length === 0) {
-    return { total: 0, verified: 0, failed: 0, results: [] };
-  }
-
-  if (!certData.certificates || certData.certificates.length < 2 ||
-      !certData.certificates[0].rawDER || !certData.certificates[1].rawDER) {
-    return { total: 0, verified: 0, failed: 0, results: [] };
-  }
-
-  const tbsCert = extractTBSCertificate(certData.certificates[0].rawDER);
-  if (!tbsCert) {
-    return { total: 0, verified: 0, failed: 0, results: [] };
-  }
-
-  const modifiedTBS = removeSCTExtension(tbsCert);
-  if (!modifiedTBS) {
-    return { total: 0, verified: 0, failed: 0, results: [] };
-  }
-
-  const issuerKeyHash = getIssuerKeyHash(certData.certificates[1]);
-
-  const results = [];
-  for (const sct of certData.scts) {
-    const verified = await verifySCT(sct, issuerKeyHash, modifiedTBS);
-    results.push({ sct, verified });
-  }
-
-  const verified = results.filter(r => r.verified).length;
-  const failed = results.length - verified;
-
-  return {
-    total: results.length,
-    verified,
-    failed,
-    results
-  };
-}
+export default { verifyCertificateSCTs };
