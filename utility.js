@@ -68,6 +68,21 @@ function base64ToBytes(base64) {
 }
 
 /**
+ * Converts base64 string to hex string
+ * @param {string} base64 - Base64 encoded string
+ * @returns {string} Hex string
+ */
+function base64ToHex(base64) {
+  const binary = atob(base64);
+  let hex = '';
+  for (let i = 0; i < binary.length; i++) {
+    const byte = binary.charCodeAt(i).toString(16).padStart(2, '0');
+    hex += byte;
+  }
+  return hex;
+}
+
+/**
  * Compares two Uint8Arrays for equality
  * @param {Uint8Array} a - First array
  * @param {Uint8Array} b - Second array
@@ -128,3 +143,19 @@ function encodeBigEndian(value, numBytes) {
   }
   return bytes;
 }
+
+// Export for browser extension (non-module)
+var utility = {
+  parseASN1Length,
+  encodeASN1Length,
+  base64ToBytes,
+  base64ToHex,
+  bytesEqual,
+  bytesToHex,
+  containsOID,
+  encodeBigEndian
+};
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = utility;
+}
+

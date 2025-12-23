@@ -11,7 +11,7 @@
   ],
 
   "background": {
-    "scripts": ["utility.js", "sct-parser.js", "ct-verify.js", "test-readonly-logs.js", "background.js"]
+    "scripts": ["utility.js", "sct-parser-bundled.js", "ct-verify.js", "test-readonly-logs.js", "background.js"]
   },
 
   "browser_action": {

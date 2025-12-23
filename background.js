@@ -35,6 +35,8 @@ browser.webRequest.onHeadersReceived.addListener(
     if (details.type !== "main_frame") {
       return;
     }
+    
+    console.log(`[SCT Inspector] onHeadersReceived for main_frame request: ${details.url}`);
 
     // Only process HTTPS requests
     if (!details.url.startsWith("https://")) {
@@ -43,7 +45,7 @@ browser.webRequest.onHeadersReceived.addListener(
     }
 
     try {
-      const startTime = performance.now();
+      const verifyStartTime = performance.now();
       console.log(`[SCT Inspector] Processing request for: ${details.url}`);
 
       // Get security information for this request
@@ -57,15 +59,15 @@ browser.webRequest.onHeadersReceived.addListener(
         }
       );
 
-      console.log(securityInfo.certificates)
-
       if (!securityInfo) {
         console.warn(`[SCT Inspector] No security info available for ${details.url}`);
         return;
       }
+      
+      console.log(`[SCT Inspector] Retrieved security info`, securityInfo);
 
       // Extract and process certificate information
-      const certData = await extractCertificateData(securityInfo, details.url);
+      const certData = extractCertificateData(securityInfo, details.url);
 
       // Store in cache indexed by tab ID for popup access
       certificateCache.set(details.tabId, certData);
@@ -73,8 +75,8 @@ browser.webRequest.onHeadersReceived.addListener(
       console.log(`[SCT Inspector] Extracted certificate data for ${details.url}`);
       console.log(certData);
 
-      const verifyStartTime = performance.now();
       const verificationResult = await verifyCertificateSCTs(certData);
+
       const verifyEndTime = performance.now();
       const verificationTimeMs = Math.round(verifyEndTime - verifyStartTime);
 
@@ -101,8 +103,8 @@ browser.webRequest.onHeadersReceived.addListener(
  * @param {string} url - The URL being accessed
  * @returns {object} Structured certificate data including SCTs
  */
-async function extractCertificateData(securityInfo, url) {
-  console.log("[SCT Inspector] Extracting certificate data for", url);
+function extractCertificateData(securityInfo, url) {
+  console.log("[SCT Inspector] Extracting certificate data");
   const certData = {
     url: url,
     timestamp: Date.now(),
@@ -114,13 +116,15 @@ async function extractCertificateData(securityInfo, url) {
   };
 
   if (securityInfo.certificates && securityInfo.certificates.length > 0) {
+    console.log("[SCT Inspector] Copying certificate chain");
     certData.certificates = securityInfo.certificates;
 
     // Parse SCTs from the leaf certificate's rawDER data
     if (securityInfo.certificates[0].rawDER) {
-      const scts = parseSCTFromCertificate(securityInfo.certificates[0].rawDER);
+      console.log("[SCT Inspector] Parsing SCTs from leaf certificate");
+      const scts = sctParser.parseSCTFromCertificate(securityInfo.certificates[0].rawDER);
       if (scts.length > 0) {
-        certData.scts = await injectLogInfo(scts);
+        certData.scts = injectLogInfo(scts);
       }
     }
   }
@@ -165,25 +169,32 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 
 async function fetchCTLogList() {
-  if (ctLogListPromise) return ctLogListPromise;
+  console.log('[SCT Inspector] Fetching CT log list');
+  if (ctLogList) {
+    console.log('[SCT Inspector] CT log list already loaded');
+    return
+  };
 
-  ctLogListPromise = (async () => {
-    try {
-      const response = await fetch(CT_LOG_LIST_URL);
-      const data = await response.json();
-      ctLogList = buildLogIdMap(data);
-      console.log(`[SCT Inspector] Loaded ${Object.keys(ctLogList).length} CT logs`);
-    } catch (error) {
-      console.error('[SCT Inspector] Failed to fetch CT log list:', error);
-    }
-  })();
-
-  return ctLogListPromise;
+  try {
+    const response = await fetch(CT_LOG_LIST_URL);
+    const data = await response.json();
+    console.log('[SCT Inspector] Fetched CT log list data', data);
+    ctLogList = buildLogIdMap(data);
+    console.log('[SCT Inspector] Built CT log ID map', ctLogList);
+    console.log(`[SCT Inspector] Loaded ${Object.keys(ctLogList).length} CT logs`);
+  } catch (error) {
+    console.error('[SCT Inspector] Failed to fetch CT log list:', error);
+  }
 }
 
 
-// Convert listing by operators to a flat map by log ID
+/**
+ * Builds log ID to metadata map from operator-grouped CT log list
+ * @param {object} logListData - CT log list grouped by operators
+ * @returns {object} Map of hex log IDs to log metadata
+ */
 function buildLogIdMap(logListData) {
+  console.log('[SCT Inspector] Building CT log ID map from log list data');
   const map = {};
 
   for (const operator of logListData.operators) {
@@ -191,7 +202,8 @@ function buildLogIdMap(logListData) {
 
     for (const log of logs) {
       if (log.log_id) {
-        const logIdHex = base64ToHex(log.log_id);
+        // Convert base64 log ID to hex, as used in SCTs
+        const logIdHex = base64ToHex(log.log_id); 
         map[logIdHex] = {
           operator: operator.name,
           description: log.description,
@@ -205,18 +217,7 @@ function buildLogIdMap(logListData) {
   return map;
 }
 
-function base64ToHex(base64) {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    const byte = binary.charCodeAt(i).toString(16).padStart(2, '0');
-    hex += byte;
-  }
-  return hex;
-}
-
-async function injectLogInfo(scts) {
-  await fetchCTLogList();
+function injectLogInfo(scts) {
 
   if (!ctLogList) return scts;
 
@@ -245,7 +246,12 @@ browser.tabs.onRemoved.addListener((tabId) => {
   console.log(`[SCT Inspector] Cleaned up cache for closed tab ${tabId}`);
 });
 
-// Fetch CT log list on startup
-fetchCTLogList();
+// Initialize
+(async () => {
+  console.log("[SCT Inspector] Starting background script...");
 
-console.log("[SCT Inspector] Background script loaded and ready");
+  await fetchCTLogList();
+
+  console.log("[SCT Inspector] Background script loaded and ready");
+  console.log("[SCT Inspector] Waiting for onHeadersReceived...");
+})();

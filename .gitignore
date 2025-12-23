@@ -1,1 +1,4 @@
 test-readonly-logs.js
+node_modules
+sct-parser-bundled.js
+sct-parser-bundled.js.LICENSE.txt

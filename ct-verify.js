@@ -201,6 +201,18 @@ async function getTreeHeadInfo(sct) {
  * Leaf hash = SHA-256(0x00 || leaf_data)
  */
 async function fetchAuditProof(merkleTreeLeaf, sct) {
+  console.log('[CT Verify] === MerkleTreeLeaf Structure Before Hashing ===');
+  console.log('[CT Verify] Length:', merkleTreeLeaf.length, 'bytes');
+  console.log('[CT Verify] Version:', merkleTreeLeaf[0]);
+  console.log('[CT Verify] Leaf type:', merkleTreeLeaf[1]);
+  console.log('[CT Verify] Timestamp:', Array.from(merkleTreeLeaf.slice(2, 10)).map(b => b.toString(16).padStart(2, '0')).join(''));
+  console.log('[CT Verify] Entry type:', merkleTreeLeaf[10], merkleTreeLeaf[11]);
+  console.log('[CT Verify] Issuer key hash:', Array.from(merkleTreeLeaf.slice(12, 44)).map(b => b.toString(16).padStart(2, '0')).join(''));
+  const tbsLength = (merkleTreeLeaf[44] << 16) | (merkleTreeLeaf[45] << 8) | merkleTreeLeaf[46];
+  console.log('[CT Verify] TBS length:', tbsLength);
+  console.log('[CT Verify] Extensions:', merkleTreeLeaf[47 + tbsLength], merkleTreeLeaf[48 + tbsLength]);
+  console.log('[CT Verify] Full structure (hex):', Array.from(merkleTreeLeaf).map(b => b.toString(16).padStart(2, '0')).join(''));
+
   const leafWithPrefix = new Uint8Array(1 + merkleTreeLeaf.length);
   leafWithPrefix[0] = 0x00;
   leafWithPrefix.set(merkleTreeLeaf, 1);
@@ -272,6 +284,7 @@ async function computeMerkleRoot(leafHash, leafIndex, auditPath, treeSize) {
  * Returns true if computed Merkle root matches the log's root hash
  */
 async function verifySCT(sct, issuerKeyHash, modifiedTBS) {
+  console.log(`[CT Verify] Starting verification for SCT from log: ${sct.logUrl || sct.logId}`);
   const merkleTreeLeaf = buildPrecertEntry(sct, issuerKeyHash, modifiedTBS);
   const proofResult = await fetchAuditProof(merkleTreeLeaf, sct);
 
