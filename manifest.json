@@ -11,11 +11,11 @@
   ],
 
   "background": {
-    "scripts": ["sct-parser-bundled.js", "ct-verify-bundled.js", "background.js"]
+    "scripts": ["dist/sct-parser-bundled.js", "dist/ct-verify-bundled.js", "src/background/background.js"]
   },
 
   "browser_action": {
     "default_title": "SCT Inspector",
-    "default_popup": "popup.html"
+    "default_popup": "src/popup/popup.html"
   }
 }

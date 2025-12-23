@@ -1,6 +1,2 @@
-test-readonly-logs.js
-node_modules
-sct-parser-bundled.js
-sct-parser-bundled.js.LICENSE.txt
-ct-verify-bundled.js
-ct-verify-bundled.js.LICENSE.txt
+node_modules/
+dist/

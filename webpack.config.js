@@ -3,10 +3,10 @@ const path = require('path');
 module.exports = [
   // SCT Parser bundle
   {
-    entry: './sct-parser.js',
+    entry: './src/utils/sct-parser.js',
     output: {
       filename: 'sct-parser-bundled.js',
-      path: path.resolve(__dirname),
+      path: path.resolve(__dirname, 'dist'),
       library: {
         name: 'sctParser',
         type: 'var',
@@ -18,10 +18,10 @@ module.exports = [
   },
   // CT Verify bundle
   {
-    entry: './ct-verify.js',
+    entry: './src/utils/ct-verify.js',
     output: {
       filename: 'ct-verify-bundled.js',
-      path: path.resolve(__dirname),
+      path: path.resolve(__dirname, 'dist'),
       library: {
         name: 'ctVerify',
         type: 'var',
