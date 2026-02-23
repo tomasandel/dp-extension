@@ -10,13 +10,28 @@
   <div class="container">
     <header>
       <h1>SCT Certificate Inspector</h1>
+      <div class="header-row">
+        <nav class="tabs">
+          <button class="tab active" data-tab="certificate">Certificate</button>
+          <button class="tab" data-tab="statistics">Statistics</button>
+        </nav>
+        <span id="stats-spinner" class="spinner hidden"></span>
+      </div>
     </header>
 
     <main id="content">
-      <div id="loading">Loading certificate data...</div>
-      <div id="error" class="hidden"></div>
-      <div id="data" class="hidden">
-        <!-- Certificate info will be injected here -->
+      <!-- Certificate tab -->
+      <div id="tab-certificate" class="tab-panel">
+        <div id="loading">Loading certificate data...</div>
+        <div id="error" class="hidden"></div>
+        <div id="data" class="hidden"></div>
+      </div>
+
+      <!-- Statistics tab -->
+      <div id="tab-statistics" class="tab-panel hidden">
+        <div id="stats-loading">Loading statistics...</div>
+        <div id="stats-error" class="hidden"></div>
+        <div id="stats-data" class="hidden"></div>
       </div>
     </main>
   </div>
