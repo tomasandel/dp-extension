@@ -6,7 +6,7 @@
  * fetches aggregate data from the backend API.
  */
 
-const BACKEND_URL = "http://localhost:3000";
+const BACKEND_URL = "https://api.jvgc-a.com";
 const STATS_REFRESH_INTERVAL_MS = 3000;
 
 let statsLoaded = false;
@@ -137,20 +137,27 @@ function displayStatistics(stats) {
   const dataDiv = document.getElementById('stats-data');
   let html = '';
 
+  // Backend URL
+  html += `<div class="backend-url" title="Backend API endpoint">${escapeHtml(BACKEND_URL)}</div>`;
+
   // Top-level summary cards
   html += `
-    <div class="stats-grid">
-      <div class="stat-card" title="Total number of Signed Tree Heads collected from all CT logs by all monitors">
-        <div class="stat-value">${stats.total_sths.toLocaleString()}</div>
-        <div class="stat-label">Total STHs</div>
-      </div>
-      <div class="stat-card" title="Number of distinct Certificate Transparency logs being monitored">
-        <div class="stat-value">${stats.unique_logs}</div>
-        <div class="stat-label">CT Logs</div>
-      </div>
-      <div class="stat-card" title="Number of distinct monitor instances reporting STHs to the backend">
-        <div class="stat-value">${stats.unique_monitors}</div>
-        <div class="stat-label">Monitors</div>
+    <div class="info-section">
+      <div class="content">
+        <div class="stats-grid">
+          <div class="stat-card" title="Total number of Signed Tree Heads collected from all CT logs by all monitors">
+            <div class="stat-value">${stats.total_sths.toLocaleString()}</div>
+            <div class="stat-label">Total STHs</div>
+          </div>
+          <div class="stat-card" title="Number of distinct Certificate Transparency logs being monitored">
+            <div class="stat-value">${stats.unique_logs}</div>
+            <div class="stat-label">CT Logs</div>
+          </div>
+          <div class="stat-card" title="Number of distinct monitor instances reporting STHs to the backend">
+            <div class="stat-value">${stats.unique_monitors}</div>
+            <div class="stat-label">Monitors</div>
+          </div>
+        </div>
       </div>
     </div>
   `;
