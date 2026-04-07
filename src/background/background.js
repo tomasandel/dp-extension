@@ -20,7 +20,14 @@ const certificateCache = new Map();
  */
 let ctLogList = null;
 let ctLogListPromise = null;
-const CT_LOG_LIST_URL = 'https://www.gstatic.com/ct/log_list/v3/log_list.json';
+// Demo: merged list (Google's logs + attack simulation logs) served by the CT log server.
+// Production: 'https://www.gstatic.com/ct/log_list/v3/log_list.json'
+const CT_LOG_LIST_URL = 'https://logs.jvgc-a.com/log-list.json';
+
+/**
+ * Backend API URL for STH consistency verification
+ */
+const BACKEND_URL = 'https://api.jvgc-a.com';
 
 /**
  * Listener for web requests - captures security information including certificates and SCTs
@@ -75,7 +82,7 @@ browser.webRequest.onHeadersReceived.addListener(
 
       console.log(`[SCT Inspector] Extracted certificate data`, certData);
 
-      const verificationResult = await ctVerify.verifyCertificateSCTs(certData);
+      const verificationResult = await ctVerify.verifyCertificateSCTs(certData, BACKEND_URL);
 
       const verifyEndTime = performance.now();
       const verificationTimeMs = Math.round(verifyEndTime - verifyStartTime);
@@ -198,16 +205,30 @@ function buildLogIdMap(logListData) {
   const map = {};
 
   for (const operator of logListData.operators) {
-    const logs = [...(operator.logs || []), ...(operator.tiled_logs || [])];
-
-    for (const log of logs) {
+    // RFC 6962 logs (traditional JSON API)
+    for (const log of (operator.logs || [])) {
       if (log.log_id) {
-        // Convert base64 log ID to hex, as used in SCTs
         const logIdHex = Convert.ToHex(Convert.FromBase64(log.log_id));
         map[logIdHex] = {
           operator: operator.name,
           description: log.description,
-          url: log.url || log.submission_url,
+          url: log.url,
+          logType: 'rfc6962',
+          state: log.state
+        };
+      }
+    }
+
+    // Static-ct / Sunlight logs (tile-based API)
+    for (const log of (operator.tiled_logs || [])) {
+      if (log.log_id) {
+        const logIdHex = Convert.ToHex(Convert.FromBase64(log.log_id));
+        map[logIdHex] = {
+          operator: operator.name,
+          description: log.description,
+          url: log.submission_url,
+          monitoringUrl: log.monitoring_url,
+          logType: 'static-ct',
           state: log.state
         };
       }
@@ -226,6 +247,8 @@ function injectLogInfo(scts) {
         logOperator: logInfo.operator,
         logDescription: logInfo.description,
         logUrl: logInfo.url,
+        logType: logInfo.logType,
+        monitoringUrl: logInfo.monitoringUrl,
         logState: logInfo.state
       };
     } else {

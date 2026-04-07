@@ -7,13 +7,15 @@
 import * as pkijs from 'pkijs';
 import * as asn1js from 'asn1js';
 import { Convert, BufferSourceConverter } from 'pvtsutils';
+import { createLogReader } from './ct-log-reader.js';
 
 /**
- * Verifies all SCTs in a certificate
+ * Verifies all SCTs in a certificate (PoI + STH consistency)
  * @param {object} certData - Certificate data including SCTs and certificates
+ * @param {string} [backendUrl] - Backend API base URL for STH consistency checks
  * @returns {Promise<object>} Verification results
  */
-async function verifyCertificateSCTs(certData) {
+async function verifyCertificateSCTs(certData, backendUrl) {
   console.log('[CT Verify] Starting SCT verification');
 
   console.log('[CT Verify] Extracting precert TBS from leaf cert');
@@ -21,22 +23,34 @@ async function verifyCertificateSCTs(certData) {
 
   console.log('[CT Verify] Getting issuer key hash from issuer cert');
   const issuerKeyHash = getIssuerKeyHash(certData.certificates[1]);
-  
+
   console.log('[CT Verify] Verifying SCTs -------------------');
-  // Verify each SCT
   const results = [];
   for (const sct of certData.scts) {
-    const verified = await verifySCT(sct, issuerKeyHash, modifiedTBS);
-    results.push({ sct, verified });
+    const reader = createLogReader(sct);
+    const poi = await verifySCT(sct, issuerKeyHash, modifiedTBS, reader);
+
+    let poc;
+    if (poi.verified && backendUrl) {
+      poc = await verifySTHConsistency(sct, poi.sthClient, backendUrl, reader);
+    } else if (!poi.verified) {
+      poc = { status: 'skipped', detail: 'PoI failed, consistency check skipped' };
+    } else {
+      poc = { status: 'skipped', detail: 'No backend URL configured' };
+    }
+
+    results.push({ sct, poi, poc });
   }
 
   console.log('[CT Verify] Verification results:', results);
 
-  const verifiedCount = results.filter(r => r.verified).length;
+  const verifiedCount = results.filter(r => r.poi.verified).length;
+  const consistencyVerifiedCount = results.filter(r => r.poc.status === 'consistent').length;
 
   return {
     verified: verifiedCount,
     total: results.length,
+    consistencyVerified: consistencyVerifiedCount,
     results
   };
 }
@@ -70,24 +84,49 @@ function getIssuerKeyHash(issuerCert) {
 
 /**
  * Verifies a single SCT against its CT log
- * Returns true if computed Merkle root matches the log's root hash
+ * Returns { verified, sthClient } where sthClient contains the STH used for PoI
  */
-async function verifySCT(sct, issuerKeyHash, modifiedTBS) {
+async function verifySCT(sct, issuerKeyHash, modifiedTBS, reader) {
   console.log('[CT Verify] Starting verification for SCT:', sct);
   console.log(`[CT Verify] from log: ${sct.logUrl || sct.logId}`);
-  const merkleTreeLeaf = buildMerkleTreeLeaf(sct, issuerKeyHash, modifiedTBS);
-  const proofResult = await fetchAuditProof(merkleTreeLeaf, sct);
 
-  if (!proofResult) {
-    return false;
+  if (!reader.supported) {
+    console.log(`[CT Verify] Log type not yet supported: ${sct.logType}`);
+    return { verified: false, detail: `Log type '${sct.logType}' not yet supported`, sthClient: null };
   }
 
-  const { proof, leafHash, rootHash, treeSize } = proofResult;
+  const merkleTreeLeaf = buildMerkleTreeLeaf(sct, issuerKeyHash, modifiedTBS);
+
+  // Compute leaf hash: SHA-256(0x00 || leaf_data)
+  const leafWithPrefix = new Uint8Array(1 + merkleTreeLeaf.length);
+  leafWithPrefix[0] = 0x00;
+  leafWithPrefix.set(merkleTreeLeaf, 1);
+  const leafHashBuffer = await crypto.subtle.digest('SHA-256', leafWithPrefix);
+  const leafHash = new Uint8Array(leafHashBuffer);
+
+  const treeHead = await reader.getTreeHead();
+  if (!treeHead) {
+    console.log('[CT Verify] Failed to get tree head info');
+    return { verified: false, detail: 'Failed to get tree head from log', sthClient: null };
+  }
+
+  const { treeSize, rootHash } = treeHead;
+
+  const proof = await reader.getInclusionProof(leafHash, treeSize);
+  if (!proof) {
+    return { verified: false, detail: 'Failed to fetch inclusion proof from log', sthClient: null };
+  }
 
   // Verify the audit proof
   const isValid = await verifyAuditProof(leafHash, proof.leaf_index, proof.audit_path, treeSize, rootHash);
 
-  return isValid;
+  return {
+    verified: isValid,
+    detail: isValid
+      ? `Audit proof verified (leaf ${proof.leaf_index}, tree size ${treeSize})`
+      : 'Audit proof verification failed (root hash mismatch)',
+    sthClient: isValid ? { treeSize, rootHash } : null
+  };
 }
 
 /**
@@ -117,47 +156,6 @@ function buildMerkleTreeLeaf(sct, issuerKeyHash, tbsCertificate) {
   return new Uint8Array(leaf);
 }
 
-/**
- * Hashes the MerkleTreeLeaf and fetches audit proof from CT log
- * Leaf hash = SHA-256(0x00 || leaf_data)
- */
-async function fetchAuditProof(merkleTreeLeaf, sct) {
-  console.log('[CT Verify] Fetching audit proof from log');
-  
-  // Prepend 0x00 byte for leaf hash
-  const leafWithPrefix = new Uint8Array(1 + merkleTreeLeaf.length);
-  leafWithPrefix[0] = 0x00;
-  leafWithPrefix.set(merkleTreeLeaf, 1);
-
-  // Compute SHA-256 hash of the leaf
-  const leafHashBuffer = await crypto.subtle.digest('SHA-256', leafWithPrefix);
-  const leafHash = new Uint8Array(leafHashBuffer);
-
-  const treeHeadInfo = await getTreeHeadInfo(sct);
-  if (!treeHeadInfo) {
-    console.log(`[CT Verify] Failed to get tree head info`);
-    return null;
-  }
-
-  const { treeSize, rootHash } = treeHeadInfo;
-
-  // Convert leaf hash to base64 for URL
-  const leafHashB64 = btoa(String.fromCharCode(...leafHash));
-
-  // Fetch audit proof from log
-  const url = `${sct.logUrl}ct/v1/get-proof-by-hash?hash=${encodeURIComponent(leafHashB64)}&tree_size=${treeSize}`;
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      return null;
-    }
-    const proof = await response.json();
-    return { proof, leafHash, rootHash, treeSize };
-  } catch (error) {
-    console.log(`[CT Verify] Fetch error: ${error.message}`);
-    return null;
-  }
-}
 
 /**
  * Verifies Merkle audit proof according to RFC 9162 Section 2.1.3.2
@@ -178,14 +176,15 @@ async function verifyAuditProof(leafHash, leafIndex, auditPath, treeSize, rootHa
     return false;
   }
 
-  // Initialize variables
-  let fn = leafIndex;
-  let sn = treeSize - 1;
+  // Use BigInt to avoid 32-bit truncation in bitwise operations
+  // (leaf indices and tree sizes routinely exceed 2^31)
+  let fn = BigInt(leafIndex);
+  let sn = BigInt(treeSize) - 1n;
   let r = leafHash;
 
   // Process each node in the audit path
   for (const pathNode of auditPath) {
-    if (sn === 0) {
+    if (sn === 0n) {
       console.log('[CT Verify] Invalid: sn reached 0 before end of path');
       return false;
     }
@@ -193,15 +192,15 @@ async function verifyAuditProof(leafHash, leafIndex, auditPath, treeSize, rootHa
     const p = new Uint8Array(Convert.FromBase64(pathNode));
 
     // Determine hash order based on LSB of fn or fn == sn
-    if ((fn & 1) === 1 || fn === sn) {
+    if ((fn & 1n) === 1n || fn === sn) {
       // Hash on left: HASH(0x01 || p || r)
       r = await hashNode(p, r);
 
       // If LSB(fn) is not set, right-shift fn and sn until LSB(fn) is set or fn is 0
-      if ((fn & 1) === 0) {
-        while ((fn & 1) === 0 && fn !== 0) {
-          fn >>= 1;
-          sn >>= 1;
+      if ((fn & 1n) === 0n) {
+        while ((fn & 1n) === 0n && fn !== 0n) {
+          fn >>= 1n;
+          sn >>= 1n;
         }
       }
     } else {
@@ -209,12 +208,12 @@ async function verifyAuditProof(leafHash, leafIndex, auditPath, treeSize, rootHa
       r = await hashNode(r, p);
     }
 
-    fn >>= 1;
-    sn >>= 1;
+    fn >>= 1n;
+    sn >>= 1n;
   }
 
   // Final verification
-  if (sn !== 0) {
+  if (sn !== 0n) {
     console.log('[CT Verify] Invalid: sn not 0 at end');
     return false;
   }
@@ -224,6 +223,90 @@ async function verifyAuditProof(leafHash, leafIndex, auditPath, treeSize, rootHa
   console.log(`[CT Verify] Proof verification result: ${isValid}`);
 
   return isValid;
+}
+
+/**
+ * Verifies a Merkle consistency proof per RFC 9162 Section 2.1.4.2.
+ * Proves that the tree of size `first` is a prefix of the tree of size `second`.
+ *
+ * @param {number} first - Size of the smaller tree
+ * @param {number} second - Size of the larger tree
+ * @param {Uint8Array} firstHash - Root hash of the smaller tree
+ * @param {Uint8Array} secondHash - Root hash of the larger tree
+ * @param {Array<Uint8Array>} consistencyPath - Array of proof node hashes
+ * @returns {Promise<boolean>} True if the proof is valid
+ */
+async function verifyConsistencyProof(first, second, firstHash, secondHash, consistencyPath) {
+  console.log(`[CT Verify] Verifying consistency proof: ${first} - ${second}, path length: ${consistencyPath.length}`);
+
+  if (first <= 0 || first >= second) {
+    console.log('[CT Verify] Invalid: first must be > 0 and < second');
+    return false;
+  }
+
+  if (consistencyPath.length === 0) {
+    console.log('[CT Verify] Invalid: empty consistency path');
+    return false;
+  }
+
+  // If first is exact power of 2, prepend firstHash to path
+  const path = [...consistencyPath];
+  if (isPowerOf2(first)) {
+    path.unshift(firstHash);
+  }
+
+  // Use BigInt to avoid 32-bit truncation in bitwise operations
+  let fn = BigInt(first) - 1n;
+  let sn = BigInt(second) - 1n;
+
+  // Right-shift both while LSB(fn) is set
+  while ((fn & 1n) === 1n) {
+    fn >>= 1n;
+    sn >>= 1n;
+  }
+
+  let fr = path[0];
+  let sr = path[0];
+
+  for (let i = 1; i < path.length; i++) {
+    const c = path[i];
+
+    if (sn === 0n) {
+      console.log('[CT Verify] Invalid: sn reached 0 before end of path');
+      return false;
+    }
+
+    if ((fn & 1n) === 1n || fn === sn) {
+      // HASH(0x01 || c || fr) and HASH(0x01 || c || sr)
+      fr = await hashNode(c, fr);
+      sr = await hashNode(c, sr);
+
+      if ((fn & 1n) === 0n) {
+        while ((fn & 1n) === 0n && fn !== 0n) {
+          fn >>= 1n;
+          sn >>= 1n;
+        }
+      }
+    } else {
+      // HASH(0x01 || sr || c)
+      sr = await hashNode(sr, c);
+    }
+
+    fn >>= 1n;
+    sn >>= 1n;
+  }
+
+  if (sn !== 0n) {
+    console.log('[CT Verify] Invalid: sn not 0 at end');
+    return false;
+  }
+
+  const frMatch = BufferSourceConverter.isEqual(fr, firstHash);
+  const srMatch = BufferSourceConverter.isEqual(sr, secondHash);
+
+  console.log(`[CT Verify] Consistency proof: fr matches firstHash=${frMatch}, sr matches secondHash=${srMatch}`);
+
+  return frMatch && srMatch;
 }
 
 /**
@@ -240,37 +323,168 @@ async function hashNode(left, right) {
   return new Uint8Array(hashBuffer);
 }
 
+
 /**
- * Gets tree head information from SCT or by fetching STH
- * For readonly logs: uses final_tree_head from log state
- * For active/retired logs: fetches current STH from log
+ * Verifies STH consistency between client-fetched STH and monitor-collected STH.
+ *
+ * @param {object} sct - SCT object with logId (hex), logUrl, logState
+ * @param {object} sthClient - { treeSize: number, rootHash: Uint8Array }
+ * @param {string} backendUrl - Backend API base URL
+ * @returns {Promise<object>} Consistency result with status, detail, sthClient, sthMonitor
  */
-async function getTreeHeadInfo(sct) {
-  console.log('[CT Verify] Getting tree head info for SCT:', sct);
+async function verifySTHConsistency(sct, sthClient, backendUrl, reader) {
+  console.log(`[CT Verify] STH consistency check for log: ${sct.logDescription || sct.logId}`);
 
-  // If log is readonly, use final_tree_head from log state
+  // Readonly logs have frozen trees - skip consistency check
   if (sct.logState && sct.logState.readonly) {
-    const finalTreeHead = sct.logState.readonly.final_tree_head;
+    console.log('[CT Verify] Readonly log, skipping consistency check');
     return {
-      treeSize: finalTreeHead.tree_size,
-      rootHash: new Uint8Array(Convert.FromBase64(finalTreeHead.sha256_root_hash))
+      status: 'skipped',
+      detail: 'Readonly log',
+      sthClient: { treeSize: sthClient.treeSize },
+      sthMonitor: null
     };
   }
 
-  // Otherwise, fetch current STH from log
-  const sthUrl = `${sct.logUrl}ct/v1/get-sth`;
+  //Fetch monitor STH from backend
+  const logIdBase64 = Convert.ToBase64(Convert.FromHex(sct.logId));
+  const sthMonitorUrl = `${backendUrl}/api/sth/${encodeURIComponent(logIdBase64)}`;
+
+  let sthMonitor;
   try {
-    const response = await fetch(sthUrl);
-    if (!response.ok) return null;
+    console.log(`[CT Verify] Fetching monitor STH from: ${sthMonitorUrl}`);
+    const response = await fetch(sthMonitorUrl);
 
-    const sth = await response.json();
-    return {
-      treeSize: sth.tree_size,
-      rootHash: new Uint8Array(Convert.FromBase64(sth.sha256_root_hash))
+    //Backend has no STH for this log
+    if (response.status === 404) {
+      console.log('[CT Verify] No monitor STH found (404) - fail-closed');
+      return {
+        status: 'no_monitor_sth',
+        detail: 'Backend has no STH for this log (fail-closed)',
+        sthClient: { treeSize: sthClient.treeSize },
+        sthMonitor: null
+      };
+    }
+
+    if (!response.ok) {
+      console.log(`[CT Verify] Backend error: ${response.status}`);
+      return {
+        status: 'error',
+        detail: `Backend returned HTTP ${response.status}`,
+        sthClient: { treeSize: sthClient.treeSize },
+        sthMonitor: null
+      };
+    }
+
+    const data = await response.json();
+    sthMonitor = {
+      treeSize: data.tree_size,
+      rootHash: new Uint8Array(Convert.FromBase64(data.root_hash))
     };
+    console.log(`[CT Verify] Monitor STH: tree_size=${sthMonitor.treeSize}`);
   } catch (error) {
-    return null;
+    console.log(`[CT Verify] Backend fetch error: ${error.message}`);
+    return {
+      status: 'error',
+      detail: `Failed to fetch monitor STH: ${error.message}`,
+      sthClient: { treeSize: sthClient.treeSize },
+      sthMonitor: null
+    };
   }
+
+  //Compare STH_client vs STH_monitor
+  const clientSize = sthClient.treeSize;
+  const monitorSize = sthMonitor.treeSize;
+
+  console.log(`[CT Verify] Comparing: client tree_size=${clientSize}, monitor tree_size=${monitorSize}`);
+
+  //Same tree_size - compare root hashes directly
+  if (clientSize === monitorSize) {
+    const hashesMatch = BufferSourceConverter.isEqual(sthClient.rootHash, sthMonitor.rootHash);
+    if (hashesMatch) {
+      console.log('[CT Verify] Same tree_size, hashes match - consistent');
+      return {
+        status: 'consistent',
+        detail: `Same tree size (${clientSize}), root hashes match`,
+        sthClient: { treeSize: clientSize },
+        sthMonitor: { treeSize: monitorSize }
+      };
+    } else {
+      console.log('[CT Verify] Same tree_size, hashes MISMATCH');
+      return {
+        status: 'inconsistent',
+        detail: `Same tree size (${clientSize}) but root hashes differ`,
+        sthClient: { treeSize: clientSize },
+        sthMonitor: { treeSize: monitorSize }
+      };
+    }
+  }
+
+  //Different tree_size - fetch and verify consistency proof
+  const first = Math.min(clientSize, monitorSize);
+  const second = Math.max(clientSize, monitorSize);
+  const firstHash = clientSize < monitorSize ? sthClient.rootHash : sthMonitor.rootHash;
+  const secondHash = clientSize < monitorSize ? sthMonitor.rootHash : sthClient.rootHash;
+
+  console.log(`[CT Verify] Different sizes, fetching consistency proof (${first} - ${second})`);
+
+  try {
+    const data = await reader.getConsistencyProof(first, second);
+    if (!data) {
+      console.log(`[CT Verify] Consistency proof fetch failed`);
+      return {
+        status: 'error',
+        detail: 'Failed to fetch consistency proof from log',
+        sthClient: { treeSize: clientSize },
+        sthMonitor: { treeSize: monitorSize }
+      };
+    }
+
+    const consistencyPath = data.consistency.map(
+      node => new Uint8Array(Convert.FromBase64(node))
+    );
+
+    console.log(`[CT Verify] Got consistency proof with ${consistencyPath.length} nodes`);
+
+    // Step 4c: Verify the consistency proof
+    const isConsistent = await verifyConsistencyProof(first, second, firstHash, secondHash, consistencyPath);
+
+    if (isConsistent) {
+      console.log('[CT Verify] Consistency proof VALID - consistent');
+      return {
+        status: 'consistent',
+        detail: `Tree sizes differ (${first} - ${second}), consistency proof valid`,
+        sthClient: { treeSize: clientSize },
+        sthMonitor: { treeSize: monitorSize }
+      };
+    } else {
+      console.log('[CT Verify] Consistency proof INVALID!');
+      return {
+        status: 'inconsistent',
+        detail: `Consistency proof invalid between sizes ${first} and ${second}`,
+        sthClient: { treeSize: clientSize },
+        sthMonitor: { treeSize: monitorSize }
+      };
+    }
+  } catch (error) {
+    console.log(`[CT Verify] Consistency proof error: ${error.message}`);
+    return {
+      status: 'error',
+      detail: `Failed to verify consistency: ${error.message}`,
+      sthClient: { treeSize: clientSize },
+      sthMonitor: { treeSize: monitorSize }
+    };
+  }
+}
+
+/**
+ * Checks if a number is an exact power of 2.
+ * @param {number} n
+ * @returns {boolean}
+ */
+function isPowerOf2(n) {
+  const b = BigInt(n);
+  return b > 0n && (b & (b - 1n)) === 0n;
 }
 
 /**
@@ -288,3 +502,16 @@ function encodeBigEndian(value, numBytes) {
   return new Uint8Array(buffer.slice(8 - numBytes));
 }
 export default { verifyCertificateSCTs };
+
+// Exported for testing
+export {
+  verifyAuditProof,
+  verifyConsistencyProof,
+  verifySTHConsistency,
+  verifySCT,
+  buildMerkleTreeLeaf,
+  extractPrecertTBS,
+  hashNode,
+  isPowerOf2,
+  encodeBigEndian,
+};
