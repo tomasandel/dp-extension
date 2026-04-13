@@ -1,4 +1,4 @@
-# SCT Certificate Inspector
+# CT Guard
 
 A Firefox extension that extracts and verifies Signed Certificate Timestamps (SCTs) from HTTPS certificates using Certificate Transparency logs.
 
@@ -29,7 +29,7 @@ A Firefox extension that extracts and verifies Signed Certificate Timestamps (SC
 ### Console Output
 The extension logs detailed information to the browser console:
 1. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`
-2. Find SCT Certificate Inspector
+2. Find CT Guard
 3. Click "Inspect" button 
 
 ## Structure

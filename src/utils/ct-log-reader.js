@@ -44,7 +44,9 @@ class RFC6962Reader {
     const url = `${this.logUrl}ct/v1/get-sth`;
     try {
       const response = await fetch(url);
-      if (!response.ok) return null;
+      if (!response.ok) {
+        return { error: 'http_error', status: response.status, detail: `HTTP ${response.status}` };
+      }
       const sth = await response.json();
       return {
         treeSize: sth.tree_size,
@@ -52,7 +54,7 @@ class RFC6962Reader {
       };
     } catch (error) {
       console.log(`[CTLogReader] Failed to fetch STH: ${error.message}`);
-      return null;
+      return { error: 'unreachable', detail: error.message };
     }
   }
 
@@ -67,11 +69,16 @@ class RFC6962Reader {
     const url = `${this.logUrl}ct/v1/get-proof-by-hash?hash=${encodeURIComponent(leafHashB64)}&tree_size=${treeSize}`;
     try {
       const response = await fetch(url);
-      if (!response.ok) return null;
+      if (!response.ok) {
+        if (response.status === 404) {
+          return { error: 'not_found', detail: 'Certificate not found in log' };
+        }
+        return { error: 'http_error', status: response.status, detail: `HTTP ${response.status}` };
+      }
       return await response.json();
     } catch (error) {
       console.log(`[CTLogReader] Failed to fetch inclusion proof: ${error.message}`);
-      return null;
+      return { error: 'unreachable', detail: error.message };
     }
   }
 
@@ -85,11 +92,13 @@ class RFC6962Reader {
     const url = `${this.logUrl}ct/v1/get-sth-consistency?first=${first}&second=${second}`;
     try {
       const response = await fetch(url);
-      if (!response.ok) return null;
+      if (!response.ok) {
+        return { error: 'http_error', status: response.status, detail: `HTTP ${response.status}` };
+      }
       return await response.json();
     } catch (error) {
       console.log(`[CTLogReader] Failed to fetch consistency proof: ${error.message}`);
-      return null;
+      return { error: 'unreachable', detail: error.message };
     }
   }
 }

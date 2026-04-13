@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "name": "SCT Certificate Inspector",
+  "name": "CT Guard",
   "version": "1.0.0",
   "description": "Extracts Signed Certificate Timestamps (SCTs) from page certificates",
 
@@ -15,7 +15,7 @@
   },
 
   "browser_action": {
-    "default_title": "SCT Inspector",
+    "default_title": "CT Guard",
     "default_popup": "src/popup/popup.html"
   }
 }

@@ -34,7 +34,8 @@ async function verifyCertificateSCTs(certData, backendUrl) {
     if (poi.verified && backendUrl) {
       poc = await verifySTHConsistency(sct, poi.sthClient, backendUrl, reader);
     } else if (!poi.verified) {
-      poc = { status: 'skipped', detail: 'PoI failed, consistency check skipped' };
+      const isRetired = sct.logState && sct.logState.retired;
+      poc = { status: 'skipped', detail: isRetired ? 'Log retired' : 'PoI failed, consistency check skipped' };
     } else {
       poc = { status: 'skipped', detail: 'No backend URL configured' };
     }
@@ -44,13 +45,16 @@ async function verifyCertificateSCTs(certData, backendUrl) {
 
   console.log('[CT Verify] Verification results:', results);
 
-  const verifiedCount = results.filter(r => r.poi.verified).length;
-  const consistencyVerifiedCount = results.filter(r => r.poc.status === 'consistent').length;
+  // One fully verified SCT is sufficient — if a certificate is verifiably included
+  // in at least one honest log whose tree is consistent with the monitor's view,
+  // the certificate is publicly auditable and CT's security goal is achieved.
+  // Unverifiable SCTs (retired log offline, log temporarily down, no monitor STH)
+  // do not fail the verdict — they simply don't contribute to it.
+  const verifiedCount = results.filter(r => r.poi.verified && (r.poc.status === 'consistent' || r.poc.status === 'skipped')).length;
 
   return {
     verified: verifiedCount,
     total: results.length,
-    consistencyVerified: consistencyVerifiedCount,
     results
   };
 }
@@ -92,7 +96,7 @@ async function verifySCT(sct, issuerKeyHash, modifiedTBS, reader) {
 
   if (!reader.supported) {
     console.log(`[CT Verify] Log type not yet supported: ${sct.logType}`);
-    return { verified: false, detail: `Log type '${sct.logType}' not yet supported`, sthClient: null };
+    return { verified: false, reason: 'unsupported_log_type', detail: `Log type '${sct.logType}' not yet supported`, sthClient: null };
   }
 
   const merkleTreeLeaf = buildMerkleTreeLeaf(sct, issuerKeyHash, modifiedTBS);
@@ -105,16 +109,31 @@ async function verifySCT(sct, issuerKeyHash, modifiedTBS, reader) {
   const leafHash = new Uint8Array(leafHashBuffer);
 
   const treeHead = await reader.getTreeHead();
+  if (treeHead?.error) {
+    console.log(`[CT Verify] Failed to get tree head: ${treeHead.error}`);
+    const isRetired = sct.logState && sct.logState.retired;
+    const reason = treeHead.error === 'unreachable' ? 'log_unreachable' : 'log_error';
+    const detail = isRetired
+      ? 'Log is retired and no longer serves its Merkle tree'
+      : `Failed to get tree head from log (${treeHead.detail})`;
+    return { verified: false, reason, detail, sthClient: null };
+  }
   if (!treeHead) {
     console.log('[CT Verify] Failed to get tree head info');
-    return { verified: false, detail: 'Failed to get tree head from log', sthClient: null };
+    return { verified: false, reason: 'log_error', detail: 'Failed to get tree head from log', sthClient: null };
   }
 
   const { treeSize, rootHash } = treeHead;
 
   const proof = await reader.getInclusionProof(leafHash, treeSize);
+  if (proof?.error) {
+    const reason = proof.error === 'not_found' ? 'not_found_in_log'
+                 : proof.error === 'unreachable' ? 'log_unreachable'
+                 : 'log_error';
+    return { verified: false, reason, detail: `Failed to fetch inclusion proof (${proof.detail})`, sthClient: null };
+  }
   if (!proof) {
-    return { verified: false, detail: 'Failed to fetch inclusion proof from log', sthClient: null };
+    return { verified: false, reason: 'log_error', detail: 'Failed to fetch inclusion proof from log', sthClient: null };
   }
 
   // Verify the audit proof
@@ -122,6 +141,7 @@ async function verifySCT(sct, issuerKeyHash, modifiedTBS, reader) {
 
   return {
     verified: isValid,
+    reason: isValid ? 'verified' : 'proof_mismatch',
     detail: isValid
       ? `Audit proof verified (leaf ${proof.leaf_index}, tree size ${treeSize})`
       : 'Audit proof verification failed (root hash mismatch)',
@@ -327,24 +347,25 @@ async function hashNode(left, right) {
 /**
  * Verifies STH consistency between client-fetched STH and monitor-collected STH.
  *
+ * For active (usable) logs: fetches a Merkle consistency proof when tree sizes
+ * differ, verifying that the smaller tree is a prefix of the larger.
+ *
+ * For readonly logs: performs an exact STH comparison instead. A readonly log has
+ * a frozen tree, so any difference in tree size or root hash between client and
+ * monitor is an unambiguous indicator of a split-world attack. This is strictly
+ * stronger than a consistency proof — it detects the append-only variant where
+ * an attacker extends the frozen tree with a fraudulent certificate, which would
+ * pass a standard consistency check (the original tree is a valid prefix of the
+ * extended tree) but fails the exact comparison (tree sizes differ).
+ *
  * @param {object} sct - SCT object with logId (hex), logUrl, logState
  * @param {object} sthClient - { treeSize: number, rootHash: Uint8Array }
  * @param {string} backendUrl - Backend API base URL
+ * @param {object} reader - CT log reader instance
  * @returns {Promise<object>} Consistency result with status, detail, sthClient, sthMonitor
  */
 async function verifySTHConsistency(sct, sthClient, backendUrl, reader) {
   console.log(`[CT Verify] STH consistency check for log: ${sct.logDescription || sct.logId}`);
-
-  // Readonly logs have frozen trees - skip consistency check
-  if (sct.logState && sct.logState.readonly) {
-    console.log('[CT Verify] Readonly log, skipping consistency check');
-    return {
-      status: 'skipped',
-      detail: 'Readonly log',
-      sthClient: { treeSize: sthClient.treeSize },
-      sthMonitor: null
-    };
-  }
 
   //Fetch monitor STH from backend
   const logIdBase64 = Convert.ToBase64(Convert.FromHex(sct.logId));
@@ -420,6 +441,17 @@ async function verifySTHConsistency(sct, sthClient, backendUrl, reader) {
     }
   }
 
+  //Different tree_size — readonly logs should never differ (frozen tree)
+  if (sct.logState && sct.logState.readonly) {
+    console.log(`[CT Verify] Readonly log tree size mismatch: client=${clientSize}, monitor=${monitorSize}`);
+    return {
+      status: 'inconsistent',
+      detail: `Readonly log tree size mismatch (client: ${clientSize}, monitor: ${monitorSize}). A frozen tree must not differ between observers.`,
+      sthClient: { treeSize: clientSize },
+      sthMonitor: { treeSize: monitorSize }
+    };
+  }
+
   //Different tree_size - fetch and verify consistency proof
   const first = Math.min(clientSize, monitorSize);
   const second = Math.max(clientSize, monitorSize);
@@ -430,11 +462,12 @@ async function verifySTHConsistency(sct, sthClient, backendUrl, reader) {
 
   try {
     const data = await reader.getConsistencyProof(first, second);
-    if (!data) {
-      console.log(`[CT Verify] Consistency proof fetch failed`);
+    if (!data || data.error) {
+      const errDetail = data?.detail || 'unknown error';
+      console.log(`[CT Verify] Consistency proof fetch failed: ${errDetail}`);
       return {
         status: 'error',
-        detail: 'Failed to fetch consistency proof from log',
+        detail: `Failed to fetch consistency proof from log (${errDetail})`,
         sthClient: { treeSize: clientSize },
         sthMonitor: { treeSize: monitorSize }
       };
