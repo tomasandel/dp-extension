@@ -46,6 +46,11 @@ const BACKEND_URL = 'https://api.jvgc-a.com';
  * This listener fires AFTER the server response headers are received (after TLS handshake completes),
  * allowing us to inspect the established secure connection and extract certificate transparency information.
  *
+ * The listener uses "blocking" mode because getSecurityInfo() requires the
+ * webRequestBlocking permission. The async handler awaits only getSecurityInfo()
+ * and certificate extraction (both fast, local operations), then dispatches
+ * CT log verification as fire-and-forget so page loading is not blocked.
+ *
  * @param {object} details - Request details from webRequest API
  */
 browser.webRequest.onHeadersReceived.addListener(
@@ -68,16 +73,12 @@ browser.webRequest.onHeadersReceived.addListener(
     }
 
     try {
-      const verifyStartTime = performance.now();
-      console.log(`[CT Guard] Processing request for: ${details.url}`);
-
-      // Get security information for this request
+      // getSecurityInfo() must be awaited while the request context is still valid.
+      // This is a fast local operation (reads already-completed TLS state).
       const securityInfo = await browser.webRequest.getSecurityInfo(
         details.requestId,
         {
-          // Request certificate chain information
           certificateChain: true,
-          // Request raw DER-encoded certificates to parse SCTs
           rawDER: true
         }
       );
@@ -89,10 +90,9 @@ browser.webRequest.onHeadersReceived.addListener(
 
       console.log(`[CT Guard] Retrieved security info`, securityInfo);
 
-      // Extract and process certificate information
+      // Certificate extraction is CPU-only (ASN.1 parsing), fast.
       const certData = extractCertificateData(securityInfo, details.url);
 
-      // Store in cache — by tab ID when available, always by hostname as fallback
       certData.verificationStatus = 'verifying';
       hostCertCache.set(hostname, certData);
       if (hasTab) {
@@ -102,41 +102,18 @@ browser.webRequest.onHeadersReceived.addListener(
 
       console.log(`[CT Guard] Extracted certificate data`, certData);
 
-      const verificationResult = await ctVerify.verifyCertificateSCTs(certData, BACKEND_URL);
-
-      const verifyEndTime = performance.now();
-      const verificationTimeMs = Math.round(verifyEndTime - verifyStartTime);
-
-      console.log(`[CT Guard] Verification: ${verificationResult.verified}/${verificationResult.total} SCTs verified in ${verificationTimeMs}ms`);
-
-      certData.sctVerification = {
-        ...verificationResult,
-        verificationTimeMs
-      };
-      certData.verificationStatus = 'complete';
-
-      const anyVerified = verificationResult.verified >= 1;
-      if (hasTab) {
-        updateBadge(tabId, anyVerified ? 'ok' : 'fail');
-
-        if (!anyVerified && !notifiedHosts.has(hostname)) {
-          notifiedHosts.add(hostname);
-          notifyVerificationFailure(tabId, details.url, verificationResult);
-        }
-      }
+      // Fire-and-forget: CT log verification runs in background.
+      // NOT awaited — the blocking handler returns here, unblocking page load.
+      runVerificationAsync(certData, tabId, hasTab, hostname, details.url);
 
     } catch (error) {
-      console.error(`[CT Guard] Error processing request:`, error);
-
+      console.error(`[CT Guard] Error extracting certificate:`, error);
       if (hasTab) {
         updateBadge(tabId, 'fail');
-
-        // Mark verification as complete with error so popup doesn't poll forever
         const certData = certificateCache.get(tabId);
         if (certData) {
           certData.verificationStatus = 'error';
         }
-
         if (!notifiedHosts.has(hostname)) {
           notifiedHosts.add(hostname);
           notifyVerificationFailure(tabId, details.url, null);
@@ -145,9 +122,57 @@ browser.webRequest.onHeadersReceived.addListener(
     }
   },
   { urls: ["<all_urls>"] },
-  // blocking mode to access security info
+  // blocking mode required by getSecurityInfo()
   ["blocking"]
 );
+
+/**
+ * Runs SCT verification asynchronously (not blocking page load).
+ */
+async function runVerificationAsync(certData, tabId, hasTab, hostname, url) {
+  try {
+    const verifyStartTime = performance.now();
+
+    const verificationResult = await ctVerify.verifyCertificateSCTs(certData, BACKEND_URL);
+
+    const verifyEndTime = performance.now();
+    const verificationTimeMs = Math.round(verifyEndTime - verifyStartTime);
+
+    console.log(`[CT Guard] Verification: ${verificationResult.verified}/${verificationResult.total} SCTs verified in ${verificationTimeMs}ms`);
+
+    certData.sctVerification = {
+      ...verificationResult,
+      verificationTimeMs
+    };
+    certData.verificationStatus = 'complete';
+
+    const anyVerified = verificationResult.verified >= 1;
+    if (hasTab) {
+      updateBadge(tabId, anyVerified ? 'ok' : 'fail');
+
+      if (!anyVerified && !notifiedHosts.has(hostname)) {
+        notifiedHosts.add(hostname);
+        notifyVerificationFailure(tabId, url, verificationResult);
+      }
+    }
+  } catch (error) {
+    console.error(`[CT Guard] Verification error:`, error);
+
+    if (hasTab) {
+      updateBadge(tabId, 'fail');
+
+      const cached = certificateCache.get(tabId);
+      if (cached) {
+        cached.verificationStatus = 'error';
+      }
+
+      if (!notifiedHosts.has(hostname)) {
+        notifiedHosts.add(hostname);
+        notifyVerificationFailure(tabId, url, null);
+      }
+    }
+  }
+}
 
 /**
  * Updates the extension icon badge for a given tab
